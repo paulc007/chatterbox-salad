@@ -56,6 +56,11 @@ app = FastAPI(title="Chatterbox-TTS", lifespan=lifespan)
 class GenerateRequest(BaseModel):
     text: str
     voice: str = "FR"  # default voice
+    temperature: float | None = None       # 0.0–2.0+, default 0.8 — randomness in sampling
+    exaggeration: float | None = None      # 0.0–1.0+, default 0.5 — emotional intensity
+    repetition_penalty: float | None = None # 1.0–2.5+, default 1.2 — reduce repetitive speech
+    top_k: int | None = None               # 1–10000+, default 1000 — top-K sampling (Turbo only)
+    cfg_weight: float | None = None        # 0.0–1.0, default 0.5 — how closely to follow reference voice
 
 
 # ---------- health probes (required by SaladCloud) ----------
@@ -104,8 +109,21 @@ async def generate(req: GenerateRequest):
     if not text:
         raise HTTPException(400, "text is required")
 
+    # Build kwargs for generate, skipping None values (let model defaults apply)
+    gen_kwargs = {}
+    if req.temperature is not None:
+        gen_kwargs["temperature"] = req.temperature
+    if req.exaggeration is not None:
+        gen_kwargs["exaggeration"] = req.exaggeration
+    if req.repetition_penalty is not None:
+        gen_kwargs["repetition_penalty"] = req.repetition_penalty
+    if req.top_k is not None:
+        gen_kwargs["top_k"] = req.top_k
+    if req.cfg_weight is not None:
+        gen_kwargs["cfg_weight"] = req.cfg_weight
+
     # Generate
-    wav = MODEL.generate(text, audio_prompt_path=ref_path)
+    wav = MODEL.generate(text, audio_prompt_path=ref_path, **gen_kwargs)
 
     # Encode to WAV bytes
     buf = io.BytesIO()
