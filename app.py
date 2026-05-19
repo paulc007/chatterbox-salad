@@ -1,13 +1,14 @@
 """
 Chatterbox-TTS API for SaladCloud GPU deployment.
 Exposes /generate endpoint with multi-voice support.
+Voices are uploaded at runtime via /upload-voice — no baked-in refs.
 """
 
 import io
 import os
 import torch
 import torchaudio as ta
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
@@ -37,15 +38,15 @@ def get_ref_path(voice: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global MODEL, AVAILABLE_VOICES
+    os.makedirs(VOICES_DIR, exist_ok=True)
     AVAILABLE_VOICES = find_voices()
-    print(f"Voices available: {AVAILABLE_VOICES}")
+    print(f"Voices available at startup: {AVAILABLE_VOICES or '(none — upload via POST /upload-voice)'}")
     print("Loading Chatterbox-Turbo model...")
     from chatterbox.tts_turbo import ChatterboxTurboTTS
     device = "cuda" if torch.cuda.is_available() else "cpu"
     MODEL = ChatterboxTurboTTS.from_pretrained(device=device)
     print(f"Model loaded on {device}")
     yield
-    # cleanup
     del MODEL
 
 
@@ -55,15 +56,15 @@ app = FastAPI(title="Chatterbox-TTS", lifespan=lifespan)
 # ---------- request model ----------
 class GenerateRequest(BaseModel):
     text: str
-    voice: str = "FR"  # default voice
-    temperature: float | None = None       # 0.0–2.0+, default 0.8 — randomness in sampling
-    exaggeration: float | None = None      # 0.0–1.0+, default 0.5 — emotional intensity
-    repetition_penalty: float | None = None # 1.0–2.5+, default 1.2 — reduce repetitive speech
-    top_k: int | None = None               # 1–10000+, default 1000 — top-K sampling (Turbo only)
-    cfg_weight: float | None = None        # 0.0–1.0, default 0.5 — how closely to follow reference voice
+    voice: str = "FR"
+    temperature: float | None = None
+    exaggeration: float | None = None
+    repetition_penalty: float | None = None
+    top_k: int | None = None
+    cfg_weight: float | None = None
 
 
-# ---------- health probes (required by SaladCloud) ----------
+# ---------- health probes ----------
 @app.get("/started")
 async def startup_probe():
     return {"status": "started"}
@@ -89,6 +90,38 @@ async def list_voices():
     return {"voices": AVAILABLE_VOICES}
 
 
+# ---------- upload voice ----------
+@app.post("/upload-voice")
+async def upload_voice(
+    file: UploadFile = File(...),
+    name: str = Form(...),
+):
+    """Upload a .wav reference file. The voice name is used as the voice ID."""
+    global AVAILABLE_VOICES
+
+    if not file.filename or not file.filename.lower().endswith(".wav"):
+        raise HTTPException(400, "Only .wav files accepted")
+
+    # Sanitize name — strip extension if accidentally included, reject path traversal
+    clean_name = os.path.splitext(name)[0].strip()
+    if not clean_name or "/" in clean_name or "\\" in clean_name:
+        raise HTTPException(400, "Invalid voice name")
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(400, "Empty file")
+
+    out_path = os.path.join(VOICES_DIR, f"{clean_name}.wav")
+    with open(out_path, "wb") as f:
+        f.write(contents)
+
+    # Rescan
+    AVAILABLE_VOICES = find_voices()
+    print(f"Voice '{clean_name}' uploaded ({len(contents)} bytes). Available: {AVAILABLE_VOICES}")
+
+    return {"voice": clean_name, "size": len(contents), "available": AVAILABLE_VOICES}
+
+
 # ---------- generate ----------
 @app.post("/generate")
 async def generate(req: GenerateRequest):
@@ -98,7 +131,7 @@ async def generate(req: GenerateRequest):
     if req.voice not in AVAILABLE_VOICES:
         raise HTTPException(
             400,
-            f"Unknown voice '{req.voice}'. Available: {', '.join(AVAILABLE_VOICES)}"
+            f"Unknown voice '{req.voice}'. Available: {', '.join(AVAILABLE_VOICES) or '(none)'}"
         )
 
     ref_path = get_ref_path(req.voice)
@@ -109,7 +142,6 @@ async def generate(req: GenerateRequest):
     if not text:
         raise HTTPException(400, "text is required")
 
-    # Build kwargs for generate, skipping None values (let model defaults apply)
     gen_kwargs = {}
     if req.temperature is not None:
         gen_kwargs["temperature"] = req.temperature
@@ -122,10 +154,8 @@ async def generate(req: GenerateRequest):
     if req.cfg_weight is not None:
         gen_kwargs["cfg_weight"] = req.cfg_weight
 
-    # Generate
     wav = MODEL.generate(text, audio_prompt_path=ref_path, **gen_kwargs)
 
-    # Encode to WAV bytes
     buf = io.BytesIO()
     ta.save(buf, wav, MODEL.sr, format="wav")
     buf.seek(0)
