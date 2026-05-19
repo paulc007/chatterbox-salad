@@ -3,3 +3,4 @@ uvicorn[standard]==0.34.0
 chatterbox-tts
 torch>=2.1.0
 torchaudio>=2.1.0
+huggingface-hub

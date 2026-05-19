@@ -8,9 +8,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps
+# Install Python deps (explicit --break-system-packages for slim image)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-download Chatterbox-Turbo model from Hugging Face during build
+# Saves 2-10 min of GPU time on every cold start
+ARG HF_TOKEN
+ENV HF_HOME=/app/hf_cache
+RUN python -c "\
+import os;\
+from huggingface_hub import snapshot_download;\
+print('Downloading ResembleAI/chatterbox-turbo...');\
+snapshot_download('ResembleAI/chatterbox-turbo', token=os.environ.get('HF_TOKEN'));\
+print('Model cached at', os.environ['HF_HOME'])"
 
 # Copy voice reference files
 COPY voices/ ./voices/
